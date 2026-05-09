@@ -17,7 +17,7 @@ def detect_text_boxes(image_path: str, langs: List[str] = ['ru', 'en']) -> List[
 
     # координаты прямоугольников, которые являются результатом этой функции
     boxes = []
-    for bbox, text, score in results
+    for bbox, text, score in results:
         xs = [int(p[0]) for p in bbox]
         ys = [int(p[1]) for p in bbox]
         x1, y1 = min(xs), min(ys)
