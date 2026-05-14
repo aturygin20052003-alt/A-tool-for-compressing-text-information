@@ -1,258 +1,327 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Random Forest для предсказания оптимального размера блока BSR.
+Быстро, стабильно, интерпретируемо — идеально для малого датасета (~300 изображений).
+"""
+
 import os
+import math
 import cv2
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, accuracy_score
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Используется: {DEVICE}")
-
-BATCH_SIZE = 16
-EPOCHS = 30
-IMAGE_SIZE = 128
-DATA_DIR = "Data"
-CSV_PATH = "optimal_blocks.csv"
-MODEL_PATH = "block_size_model.pth"
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
 
 
-def load_data():
-    """ данные, сопоставляя CSV с файлами в папке Data"""
-    df = pd.read_csv(CSV_PATH)
-    print(f"CSV строк: {len(df)}")
+# ==================== 1. Извлечение признаков ====================
+
+def extract_features(image_path: str) -> dict:
+    """
+    Извлекает простые, но эффективные признаки из изображения.
+    Без OCR — быстро и стабильно.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
     
-    # Получаем список всех файлов в Data
-    if not os.path.exists(DATA_DIR):
-        print(f"❌ Папка {DATA_DIR} не найдена")
-        return [], []
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Создаём словарь: имя файла -> путь
-    file_dict = {}
-    for filename in os.listdir(DATA_DIR):
-        name, ext = os.path.splitext(filename)
-        if ext.lower() in ['.png', '.jpg', '.jpeg']:
-            file_dict[name] = os.path.join(DATA_DIR, filename)
+    # Статистика яркости
+    mean_int = np.mean(gray)
+    std_int = np.std(gray)
     
-    print(f" Найдено изображений в Data: {len(file_dict)}")
-    print(f"   Примеры: {list(file_dict.keys())[:10]}")
+    # Оценка "текстовости": доля тёмных пикселей (текст обычно чёрный)
+    dark_ratio = np.mean(gray < 128)
     
-    # Сопоставляем
-    image_paths = []
-    labels = []
-    matched = 0
-    missing = []
+    # Плотность краёв (текст = много границ)
+    edges = cv2.Laplacian(gray, cv2.CV_64F)
+    edge_var = np.var(edges)
+    edge_mean = np.mean(np.abs(edges))
     
+    # Простая оценка "плотности текста" через порогование
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    text_density = np.mean(thresh == 0)  # Доля чёрных пикселей после бинаризации
+    
+    return {
+        # Геометрия
+        'height': h,
+        'width': w,
+        'aspect_ratio': w / h if h > 0 else 1.0,
+        'area': h * w,
+        'min_dim': min(h, w),
+        'max_dim': max(h, w),
+        'sqrt_min_dim': math.sqrt(min(h, w)),
+        
+        # Статистика яркости
+        'mean_intensity': mean_int,
+        'std_intensity': std_int,
+        'intensity_range': np.max(gray) - np.min(gray),
+        
+        # Текстовые признаки
+        'dark_pixel_ratio': dark_ratio,
+        'text_density_otsu': text_density,
+        'edge_variance': edge_var,
+        'edge_mean_abs': edge_mean,
+        
+        # Комбинированные
+        'text_to_area': text_density * (h * w) / 1e6,  # Нормализованная "масса" текста
+    }
+
+
+# ==================== 2. Ограничение кратности ====================
+
+def find_valid_blocks(h: int, w: int, max_block: int = None) -> list:
+    """Возвращает все b, которые делят h и w нацело."""
+    if max_block is None:
+        max_block = int(math.sqrt(min(h, w)))
+    return [b for b in range(1, max_block + 1) if h % b == 0 and w % b == 0]
+
+def enforce_divisibility(pred_b: float, h: int, w: int) -> int:
+    """Корректирует предсказание до ближайшего валидного делителя."""
+    valid = find_valid_blocks(h, w)
+    if not valid:
+        return 1
+    return min(valid, key=lambda b: abs(b - pred_b))
+
+
+# ==================== 3. Подготовка данных ====================
+
+def prepare_data(csv_path: str, data_dir: str = "Data", 
+                 test_size: float = 0.2, val_size: float = 0.15, random_state: int = 42):
+    """Загружает CSV, извлекает признаки, делит на train/val/test."""
+    
+    df = pd.read_csv(csv_path)
+    df['image_id'] = df['image_id'].astype(int).astype(str)  # Убираем ".0"
+    
+    X_list, y_list, h_list, w_list, paths = [], [], [], [], []
+    
+    print(f"🔍 Извлечение признаков из {len(df)} изображений...")
     for _, row in df.iterrows():
-        block = row['optimal_block']
-        if pd.isna(block):
+        img_id = row['image_id']
+        path = None
+        for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif']:
+            p = os.path.join(data_dir, f"{img_id}{ext}")
+            if os.path.exists(p):
+                path = p
+                break
+        
+        if path is None:
+            continue
+            
+        features = extract_features(path)
+        if features is None:
             continue
         
+        img = cv2.imread(path)
+        h, w = img.shape[:2]
         
-        img_id = str(int(row['image_id']))
-        
-        if img_id in file_dict:
-            image_paths.append(file_dict[img_id])
-            labels.append(int(block))
-            matched += 1
-        else:
-            missing.append(img_id)
+        X_list.append(features)
+        y_list.append(row['optimal_block'])
+        h_list.append(h)
+        w_list.append(w)
+        paths.append(path)
     
-    print(f" Найдено соответствий: {matched}")
-    if missing:
-        print(f" Не найдено {len(missing)} файлов, примеры: {missing[:10]}")
+    if len(X_list) == 0:
+        raise ValueError("❌ Не найдено ни одного изображения! Проверьте пути.")
     
-    return image_paths, labels
-
-
-class BlockDataset(Dataset):
-    def __init__(self, paths, labels, transform=None):
-        self.paths = paths
-        self.labels = labels
-        self.transform = transform
+    X = pd.DataFrame(X_list)
+    y = np.array(y_list)
     
-    def __len__(self):
-        return len(self.paths)
+    print(f"✅ Извлечено {len(X)} образцов с {X.shape[1]} признаками\n")
     
-    def __getitem__(self, idx):
-        img = cv2.imread(self.paths[idx])
-        if img is None:
-            img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        if self.transform:
-            img = self.transform(img)
-        
-        label = self.labels[idx] - 1  # классы от 0 до 19
-        return img, label
-
-
-class BlockSizePredictor(nn.Module):
-    def __init__(self, num_classes=20):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
-        )
-        self.fc = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, num_classes)
-        )
+    # Стратифицированный сплит по бинам целевой переменной
+    y_bins = pd.cut(y, bins=min(5, len(np.unique(y))), labels=False)
     
-    def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
-
-
-def main():
-    
-    print("ОБУЧЕНИЕ МОДЕЛИ ДЛЯ ПРЕДСКАЗАНИЯ РАЗМЕРА БЛОКА")
-    
-    
-    # Загрузка данных
-    paths, labels = load_data()
-    
-    if len(paths) == 0:
-        print("\n Нет данных для обучения!")
-        return
-    
-    # Разделение на train/val/test
-    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
-        paths, labels, test_size=0.3, random_state=42
-    )
-    val_paths, test_paths, val_labels, test_labels = train_test_split(
-        temp_paths, temp_labels, test_size=0.5, random_state=42
+    X_train, X_temp, y_train, y_temp, h_train, h_temp, w_train, w_temp, paths_train, paths_temp = train_test_split(
+        X, y, h_list, w_list, paths,
+        test_size=test_size + val_size, random_state=random_state, stratify=y_bins
     )
     
-    print(f"\n Размеры выборок:")
-    print(f"   Train: {len(train_paths)}")
-    print(f"   Val:   {len(val_paths)}")
-    print(f"   Test:  {len(test_paths)}")
+    y_temp_bins = pd.cut(y_temp, bins=min(5, len(np.unique(y_temp))), labels=False)
+    X_val, X_test, y_val, y_test, h_val, h_test, w_val, w_test, paths_val, paths_test = train_test_split(
+        X_temp, y_temp, h_temp, w_temp, paths_temp,
+        test_size=test_size / (test_size + val_size), random_state=random_state, stratify=y_temp_bins
+    )
     
-    # Трансформации
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    print(f"📊 Размеры выборок: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
     
-    # DataLoader
-    train_loader = DataLoader(BlockDataset(train_paths, train_labels, transform), 
-                              batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(BlockDataset(val_paths, val_labels, transform), 
-                            batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(BlockDataset(test_paths, test_labels, transform), 
-                             batch_size=BATCH_SIZE, shuffle=False)
+    data = {
+        'train': (X_train, y_train, h_train, w_train, paths_train),
+        'val': (X_val, y_val, h_val, w_val, paths_val),
+        'test': (X_test, y_test, h_test, w_test, paths_test)
+    }
     
-    # Модель
-    model = BlockSizePredictor().to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    return data
+
+
+# ==================== 4. Метрики ====================
+
+def compute_metrics(preds_raw, targets, h_dims, w_dims):
+    """Считает метрики с учётом корректировки на кратность."""
+    preds_raw = np.array(preds_raw)
+    targets = np.array(targets)
     
-    print(f"\n Модель: {sum(p.numel() for p in model.parameters()):,} параметров")
+    # Сырые метрики
+    mae_raw = mean_absolute_error(targets, preds_raw)
     
-    # Обучение
-    best_val_loss = float('inf')
+    # Корректировка на кратность
+    preds_corr = np.array([enforce_divisibility(p, int(h), int(w)) 
+                           for p, h, w in zip(preds_raw, h_dims, w_dims)])
     
-    for epoch in range(EPOCHS):
-        # Train
-        model.train()
-        train_loss = 0
-        for imgs, lbls in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
-            imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(imgs), lbls)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+    mae_corr = mean_absolute_error(targets, preds_corr)
+    acc_exact = accuracy_score(targets, preds_corr)
+    acc_within_1 = np.mean(np.abs(preds_corr - targets) <= 1)
+    max_err = np.max(np.abs(preds_corr - targets))
+    
+    return {
+        'mae_raw': mae_raw, 'mae_corr': mae_corr,
+        'acc_exact': acc_exact, 'acc_1': acc_within_1, 'max_err': max_err
+    }
+
+
+# ==================== 5. Обучение ====================
+
+def train_model(data, model_type='rf', **kwargs):
+    """Обучает модель и возвращает метрики по всем сплитам."""
+    
+    # Выбор модели
+    if model_type == 'rf':
+        model = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+            **kwargs
+        )
+    elif model_type == 'gb':
+        model = GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            random_state=42,
+            **kwargs
+        )
+    else:
+        raise ValueError(f"Неизвестный тип модели: {model_type}")
+    
+    X_train, y_train, h_train, w_train, _ = data['train']
+    X_val, y_val, h_val, w_val, _ = data['val']
+    X_test, y_test, h_test, w_test, _ = data['test']
+    
+    print(f"\n🔄 Обучение {model_type.upper()}...")
+    model.fit(X_train, y_train)
+    
+    # Оценка
+    results = {}
+    for name, (X, y, h, w, _) in [('Train', data['train']), ('Val', data['val']), ('Test', data['test'])]:
+        preds = model.predict(X)
+        metrics = compute_metrics(preds, y, h, w)
+        results[name.lower()] = metrics
         
-        # Validation
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for imgs, lbls in val_loader:
-                imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
-                outputs = model(imgs)
-                val_loss += criterion(outputs, lbls).item()
-                _, pred = torch.max(outputs, 1)
-                total += lbls.size(0)
-                correct += (pred == lbls).sum().item()
-        
-        train_loss /= len(train_loader)
-        val_loss /= len(val_loader)
-        accuracy = correct / total
-        
-        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val Acc={accuracy:.4f}")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), MODEL_PATH)
-            print(f" Сохранена лучшая модель")
+        print(f"\n📊 {name}:")
+        print(f"  MAE (raw)       : {metrics['mae_raw']:.3f}")
+        print(f"  MAE (corrected) : {metrics['mae_corr']:.3f}")
+        print(f"  Accuracy (exact): {metrics['acc_exact']:.1%}")
+        print(f"  Accuracy (±1)   : {metrics['acc_1']:.1%}")
+        print(f"  Max Error       : {metrics['max_err']}")
     
-    # Тестирование
-   
-    print("ТЕСТИРОВАНИЕ")
+    return model, results
+
+
+# ==================== 6. Визуализация ====================
+
+def plot_feature_importance(model, feature_names, save_path='feature_importance.png', top_n=15):
+    """Строит график важности признаков."""
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[-top_n:]
     
-    
-    model.load_state_dict(torch.load(MODEL_PATH))
-    model.eval()
-    
-    predictions = []
-    true_labels = []
-    
-    with torch.no_grad():
-        for imgs, lbls in test_loader:
-            imgs = imgs.to(DEVICE)
-            outputs = model(imgs)
-            _, pred = torch.max(outputs, 1)
-            predictions.extend(pred.cpu().numpy())
-            true_labels.extend(lbls.numpy())
-    
-    pred_blocks = np.array(predictions) + 1
-    true_blocks = np.array(true_labels) + 1
-    
-    mae = mean_absolute_error(true_blocks, pred_blocks)
-    acc = accuracy_score(true_labels, predictions)
-    
-    print(f"Точность (Accuracy): {acc:.4f}")
-    print(f"Средняя абсолютная ошибка (MAE): {mae:.2f}")
-    
-    # Сохраняем
-    results = pd.DataFrame({
-        'true_block': true_blocks,
-        'pred_block': pred_blocks,
-        'error': abs(pred_blocks - true_blocks)
-    })
-    results.to_csv('test_predictions.csv', index=False)
-    
-    # График
-    plt.figure(figsize=(10, 5))
-    plt.hist(pred_blocks - true_blocks, bins=20, alpha=0.7, color='blue', edgecolor='black')
-    plt.xlabel('Разница (предсказание - истина)')
-    plt.ylabel('Количество')
-    plt.title('Гистограмма ошибок предсказаний')
-    plt.axvline(x=0, color='red', linestyle='--')
+    plt.figure(figsize=(10, 6))
+    plt.title('Важность признаков (Top 15)')
+    plt.barh(range(len(indices)), importances[indices], color='steelblue')
+    plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
+    plt.xlabel('Важность')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"📊 Важность признаков сохранена в {save_path}")
+
+
+def plot_predictions(y_true, y_pred_corr, split_name='Test', save_path=None):
+    """Scatter-plot: предсказание vs истинное значение."""
+    plt.figure(figsize=(6, 6))
+    plt.scatter(y_true, y_pred_corr, alpha=0.6, edgecolors='black')
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', label='Идеальное предсказание')
+    plt.xlabel('Истинный оптимальный блок')
+    plt.ylabel('Предсказанный блок (скорректированный)')
+    plt.title(f'{split_name}: Предсказания модели')
+    plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig('prediction_errors.png', dpi=150)
-    plt.show()
-    
-    print(f"\n Модель сохранена: {MODEL_PATH}")
-    print(f" Предсказания: test_predictions.csv")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"📊 График предсказаний сохранён в {save_path}")
+    plt.close()
 
+
+# ==================== 7. Запуск ====================
 
 if __name__ == "__main__":
-    main()
+    # Настройки
+    CSV_PATH = "optimal_blocks.csv"
+    DATA_DIR = "Data"
+    MODEL_TYPE = 'rf'  # 'rf' или 'gb'
+    SAVE_MODEL = True
+    
+    print("🌲 Random Forest для предсказания оптимального блока BSR\n")
+    
+    # 1. Подготовка данных
+    data = prepare_data(CSV_PATH, DATA_DIR)
+    
+    # 2. Обучение
+    model, results = train_model(data, model_type=MODEL_TYPE)
+    
+    # 3. Сохранение модели
+    if SAVE_MODEL:
+        joblib.dump(model, 'rf_block_predictor.pkl')
+        print(f"\n💾 Модель сохранена: rf_block_predictor.pkl")
+    
+    # 4. Визуализация
+    print("\n📈 Генерация графиков...")
+    plot_feature_importance(model, data['train'][0].columns.tolist())
+    
+    # График предсказаний на тесте
+    X_test, y_test, h_test, w_test, _ = data['test']
+    preds_test = model.predict(X_test)
+    preds_corr = [enforce_divisibility(p, int(h), int(w)) for p, h, w in zip(preds_test, h_test, w_test)]
+    plot_predictions(y_test, preds_corr, split_name='Test', save_path='predictions_scatter.png')
+    
+    # 5. Финальная сводка
+    print("\n" + "="*52)
+    print("🏁 ИТОГОВЫЕ РЕЗУЛЬТАТЫ")
+    print("="*52)
+    print(f"{'Выборка':<10} | {'Acc (exact)':<12} | {'Acc (±1)':<10} | {'MAE (corr)'}")
+    print("-"*52)
+    for split in ['train', 'val', 'test']:
+        m = results[split]
+        print(f"{split.upper():<10} | {m['acc_exact']:<12.1%} | {m['acc_1']:<10.1%} | {m['mae_corr']:.3f}")
+    print("="*52)
+    
+    # 6. Топ-5 важных признаков
+    print(f"\n🔍 Топ-5 важных признаков:")
+    importances = model.feature_importances_
+    feat_names = data['train'][0].columns.tolist()
+    top_idx = np.argsort(importances)[-5:][::-1]
+    for i, idx in enumerate(top_idx, 1):
+        print(f"  {i}. {feat_names[idx]}: {importances[idx]:.3f}")
+    
+    print("\n✅ Всё готово! Модель можно использовать для предсказания на новых изображениях.")

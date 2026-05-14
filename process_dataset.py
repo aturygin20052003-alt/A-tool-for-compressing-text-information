@@ -70,7 +70,7 @@ def find_optimal_block_size(
     boxes = detect_text_boxes(image_path)
     text_image = extract_text_only(image_path, boxes, padding=padding)
     
-    # Шаг 2: Получение размеров для определения диапазона блоков
+    # Шаг 2: Получение размеров матрицы
     h, w = text_image.shape
     min_dim = min(h, w)
     max_block = int(math.sqrt(min_dim))
@@ -78,28 +78,29 @@ def find_optimal_block_size(
     if max_block < 1:
         return 1, 0.0
     
-    best_score = -np.inf
-    optimal_block = 1
+    # 🔧 Шаг 3: Находим все допустимые блоки (которые делят h и w нацело)
+    valid_blocks = [
+        b for b in range(1, max_block + 1)
+        if h % b == 0 and w % b == 0
+    ]
     
-    # Шаг 3: Перебор размеров блоков от 1 до sqrt(min_dimension)
-    for b in range(1, max_block + 1):
-        # Проверяем делимость размеров на размер блока
-        h_adj = (h // b) * b
-        w_adj = (w // b) * b
-        
-        if h_adj == 0 or w_adj == 0:
-            continue
-            
-        # Обрезаем изображение до кратных размеров
-        cropped = text_image[:h_adj, :w_adj]
-        
+    if not valid_blocks:
+        # Если ни один блок не подходит, используем b=1 (всегда делится)
+        valid_blocks = [1]
+    
+    best_score = -np.inf
+    optimal_block = valid_blocks[0]
+    
+    # 🔧 Шаг 4: Перебираем ТОЛЬКО подходящие блоки (БЕЗ обрезки матрицы!)
+    for b in valid_blocks:
         try:
             if metric == 'compression':
-                score = calculate_compression_ratio(cropped, b)
+                # Используем ПОЛНУЮ матрицу, без обрезки
+                score = calculate_compression_ratio(text_image, b)
             elif metric == 'sparsity':
-                bsr = to_bsr(cropped, b=b)
+                bsr = to_bsr(text_image, b=b)
                 # Доля ненулевых блоков (чем меньше, тем лучше разреженность)
-                total_blocks = (h_adj // b) * (w_adj // b)
+                total_blocks = (h // b) * (w // b)
                 nonzero_blocks = bsr.data.shape[0]
                 score = 1.0 - (nonzero_blocks / total_blocks) if total_blocks > 0 else 0
             else:
@@ -109,11 +110,10 @@ def find_optimal_block_size(
                 best_score = score
                 optimal_block = b
                 
-        except ValueError as e:
-            # Пропускаем размеры блоков, не подходящие для данной матрицы
-            if "должны нацело делиться" in str(e):
-                continue
-            raise
+        except Exception as e:
+            # Пропускаем блоки, которые вызвали ошибку
+            print(f"  ⚠️ Пропущен блок b={b}: {e}")
+            continue
     
     return optimal_block, best_score
 
