@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import easyocr
 import matplotlib.pyplot as plt
+from typing import List, Tuple
 
 # Инициализация
 reader = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
