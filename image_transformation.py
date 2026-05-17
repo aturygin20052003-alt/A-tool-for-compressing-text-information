@@ -38,7 +38,7 @@ def detect_text_boxes(image_path: str) -> List[Tuple[int, int, int, int]]:
         ))
     return boxes
 
-def extract_text_only(image_path: str, boxes: List[Tuple[int, int, int, int]]) -> np.ndarray:
+def extract_text_only(image_path: str, boxes: List[Tuple[int, int, int, int]], padding: int = 2) -> np.ndarray:
     img = cv2.imread(image_path)
     if img is None: return np.array([])
     
