@@ -80,7 +80,7 @@ def predict_block_size(image_path: str):
     X = pd.DataFrame([feat_dict])
     raw_pred = model.predict(X)[0]
     final_pred = enforce_divisibility_safe(raw_pred, h, w)
-    return raw_pred, final_pred
+    return final_pred
 
 if __name__ == "__main__":
     SCRIPT_DIR = Path(__file__).parent
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     print("🔍 ПРЕДСКАЗАНИЕ (Raw → Final)\n")
     for img_path in test_images:
         try:
-            raw, final = predict_block_size(str(img_path))
-            print(f"✅ {img_path.name:15} | Сырое: {raw:5.2f} → Итог: {final}x{final}")
+            pred = predict_block_size(str(img_path))
+            print(f"✅ {img_path.name:15} | Предсказание: {pred}")
         except Exception as e:
             print(f"❌ {img_path.name:15} | Ошибка: {e}")
