@@ -1,8 +1,0 @@
-Как использовать модель дальше:
-Для любого нового изображения:
-
-
-from predict import predict_block_size
-
-block = predict_block_size("путь к изображению.png")
-print(f"Оптимальный блок: {block}")

@@ -1,3 +1,9 @@
+import cv2
+import numpy as np
+import easyocr
+import matplotlib.pyplot as plt
+from typing import List, Tuple
+
 def detect_text_boxes_cv2(image_path: str) -> List[Tuple[int, int, int, int]]:
     img = cv2.imread(image_path)
     if img is None: return []
